@@ -24,6 +24,8 @@ type Node interface {
 	Verify(ctx context.Context, expectedChainID *big.Int) (err error)
 
 	State() NodeState
+	DeclareDead()
+	DeclareOutOfSync()
 
 	CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error
 	BatchCallContext(ctx context.Context, b []rpc.BatchElem) error
@@ -57,11 +59,19 @@ type rawclient struct {
 type NodeState int
 
 const (
+	// NodeStateUndialed is the first state of a virgin node
 	NodeStateUndialed = NodeState(iota)
+	// NodeStateDialed is after a node has successfully dialled but before it has verified the correct chain ID
 	NodeStateDialed
+	// NodeStateInvalidChainID is after chain ID verification failed
 	NodeStateInvalidChainID
+	// NodeStateAlive is a healthy node after chain ID verification succeeded
 	NodeStateAlive
-	NodeStateDead
+	// NodeStateUnreachable is a node that got disconnected or could not be reached during dialling
+	NodeStateUnreachable
+	// NodeStateBroken is a node that is behaving erratically, either it is timing out on queries, heads are not being received or out of date heads are being received. This will generally require manual intervention to fix
+	NodeStateBroken
+	// NodeStateClosed is after the connection has been closed and the node is at the end of its lifecycle
 	NodeStateClosed
 )
 
@@ -91,7 +101,7 @@ func NewNode(lggr logger.Logger, wsuri url.URL, httpuri *url.URL, name string) N
 }
 
 // Dialling an Alive node is noop
-// Can dial Dead or Undialed nodes
+// Can dial Unreachable or Undialed nodes
 // Cannot dial a closed node
 func (n *node) Dial(ctx context.Context) error {
 	ctx, cancel := DefaultQueryCtx(ctx)
@@ -116,7 +126,7 @@ func (n *node) Dial(ctx context.Context) error {
 	uri := n.ws.uri.String()
 	wsrpc, err := rpc.DialWebsocket(ctx, uri, "")
 	if err != nil {
-		n.state = NodeStateDead
+		n.state = NodeStateUnreachable
 		return errors.Wrapf(err, "error while dialing websocket: %v", uri)
 	}
 
@@ -125,7 +135,7 @@ func (n *node) Dial(ctx context.Context) error {
 		uri := n.http.uri.String()
 		httprpc, err = rpc.DialHTTP(uri)
 		if err != nil {
-			n.state = NodeStateDead
+			n.state = NodeStateUnreachable
 			return errors.Wrapf(err, "error while dialing HTTP: %v", uri)
 		}
 	}
@@ -161,8 +171,8 @@ func (n *node) Verify(ctx context.Context, expectedChainID *big.Int) (err error)
 	if n.state == NodeStateUndialed {
 		return errors.New("cannot verify undialed node")
 	}
-	if n.state == NodeStateDead {
-		return errors.New("cannot verify dead node")
+	if n.state == NodeStateUnreachable {
+		return errors.New("cannot verify unreachable node")
 	}
 
 	var chainID *big.Int
@@ -200,6 +210,30 @@ func (n *node) State() NodeState {
 	n.mu.RLock()
 	defer n.mu.RUnlock()
 	return n.state
+}
+
+func (n *node) DeclareDead() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state == NodeStateAlive {
+		// TODO: Might be nice to cancel all contexts here also, e.g. for http calls
+		n.ws.rpc.Close()
+		n.state = NodeStateDead
+	} else {
+		panic(fmt.Sprintf("cannot transition from %s to NodeStateDead", n.state))
+	}
+}
+
+func (n *node) DeclareOutOfSync() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.state == NodeStateAlive {
+		// TODO: Might be nice to cancel all contexts here also, e.g. for http calls
+		n.ws.rpc.Close()
+		n.state = NodeStateOutOfSync
+	} else {
+		panic(fmt.Sprintf("cannot transition from %s to NodeStateDead", n.state))
+	}
 }
 
 // RPC wrappers

@@ -2,6 +2,9 @@ package client
 
 import (
 	"context"
+	"fmt"
+	"sync"
+	"time"
 
 	evmtypes "github.com/smartcontractkit/chainlink/core/chains/evm/types"
 	"github.com/smartcontractkit/chainlink/core/services"
@@ -36,17 +39,103 @@ func (l *livenessChecker) Close() error {
 func (l *livenessChecker) loop() {
 	defer close(l.chDone)
 
-	listeners := make(map[Node]chan<- *evmtypes.Head)
+	var wg sync.WaitGroup
+	headCollection := &headsCollection{make(map[Node]int64), sync.RWMutex{}}
+	listeners := make(map[Node]*nodeMonitor)
+	wg.Add(len(l.pool.nodes))
 	for _, n := range l.pool.nodes {
 		ch := make(chan<- *evmtypes.Head)
-		listeners[n] = ch
-		if sub, err := n.EthSubscribe(context.TODO(), ch, "newHeads"); err != nil {
-			panic("TODO", sub)
-		}
+		m := &nodeMonitor{ch, -1}
+		listeners[n] = m
+		go n.loop(l.ctx, wg, headsCollection)
 	}
 
+	wg.Wait()
+}
+
+type headsCollection struct {
+	latestNums map[Node]int64
+	mu         sync.RWMutex
+}
+
+func (h *headsCollection) setLatest(n Node, latestNum int64) {
+	h.mu.Lock()
+	defer h.mu.RUnlock()
+	current := h.latestNums[n]
+	if latestNum > current {
+		h.latestNums[n] = latestNum
+	}
+}
+
+func (h *headsCollection) getLatest() (latest int64) {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for _, n := range h.latestNums {
+		if n > latest {
+			latest = n
+		}
+	}
+	return
+}
+
+// const NoHeadsAlar
+type nodeMonitor struct {
+	node          Node
+	latestHeadNum int64
+}
+
+// From fiews failover proxy: https://github.com/Fiews/ChainlinkEthFailover/blob/master/index.js
+// const headersTimeout = process.env.HEADERS_TIMEOUT*1000 || 180000
+const headersTimeout = 3 * time.Minute // TODO: Needs to be configurable
+const headersCheckUpToDate = headersTimeout / 10
+
+// headNumLagThreshold is the maximum amount of heads the node is allowed to be
+// behind the latest head from all nodes before it is marked dead
+const headNumLagThreshold = 10
+
+func (nm *nodeMonitor) loop(ctx context.Context, wg sync.WaitGroup, h *headsCollection) {
+	defer wg.Done()
+	ch := make(chan *evmtypes.Head)
+	sub, err := nm.node.EthSubscribe(ctx, ch, "newHeads")
+	if err != nil {
+		panic("TODO", sub)
+	}
+
+	t1 := time.NewTicker(headersTimeout)
+	t2 := time.NewTicker(headersCheckUpToDate)
+
+	var latest int64
+
 	for {
-		select {}
+		select {
+		case <-ctx.Done():
+			return
+
+		case blockHeader, open := <-ch:
+			if !open {
+				panic("TODO")
+			}
+			num := blockHeader.Number
+			if num > latest {
+				h.setLatest(nm.node, num)
+			}
+			t1.Reset(headersTimeout)
+
+		case err, open := <-sub.Err():
+			if open && err != nil {
+				// TODO: Put it into the revive loop
+				// TODO: DeclareDead(reason)
+				nm.DeclareDead()
+			}
+		case <-t1.C:
+			// We haven't received a head on the channel for the threshold, mark it dead
+			panic("Node is dead, mark it")
+		case <-t2.C:
+			latestOfAll := h.getLatest()
+			if latest < latestOfAll-headNumLagThreshold {
+				nm.node.DeclareOutOfSync()
+			}
+		}
 	}
 }
 
