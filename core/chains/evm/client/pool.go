@@ -63,7 +63,8 @@ func (p *Pool) Dial(ctx context.Context) error {
 			}
 		}
 		for _, s := range p.sendonlys {
-			// TODO: Deal with sendonly nodes state
+			// TODO: Deal with sendonly nodes state?
+			// See: https://app.shortcut.com/chainlinklabs/story/8403/multiple-primary-geth-nodes-with-failover-load-balancer-part-2
 			err := s.Dial(ctx)
 			if err != nil {
 				return err
