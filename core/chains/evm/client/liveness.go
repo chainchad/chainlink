@@ -125,7 +125,8 @@ func (nm *nodeMonitor) loop(ctx context.Context, wg sync.WaitGroup, h *headsColl
 			if open && err != nil {
 				// TODO: Put it into the revive loop
 				// TODO: DeclareDead(reason)
-				nm.DeclareDead()
+				// TODO: What if all the nodes are dead?
+				nm.node.DeclareDead()
 			}
 		case <-t1.C:
 			// We haven't received a head on the channel for the threshold, mark it dead
