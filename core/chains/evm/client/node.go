@@ -28,7 +28,7 @@ type Node interface {
 	Verify(ctx context.Context, expectedChainID *big.Int) (err error)
 
 	State() NodeState
-	DeclareBroken(reason string, brokenAt time.Time)
+	DeclareOutOfSync(lastSeenBlock int64)
 
 	CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error
 	BatchCallContext(ctx context.Context, b []rpc.BatchElem) error
@@ -72,8 +72,12 @@ const (
 	NodeStateInvalidChainID
 	// NodeStateAlive is a healthy node after chain ID verification succeeded
 	NodeStateAlive
-	// NodeStateBroken is a node that is behaving erratically, either it is timing out on queries, heads are not being received or out of date heads are being received. This will generally require manual intervention to fix
-	NodeStateBroken
+	// NodeStateUnreachable is a node that cannot be dialled or has disconnected
+	NodeStateUnreachable
+	// NodeStateOutOfSync is a node that is accepting connections but exceeded
+	// the failure threshold without sending any new heads
+	// It will be put into a revive loop and re-awakened if a new head arrives
+	NodeStateOutOfSync
 	// NodeStateClosed is after the connection has been closed and the node is at the end of its lifecycle
 	NodeStateClosed
 )
@@ -85,6 +89,7 @@ type node struct {
 	http *rawclient
 	log  logger.Logger
 	name string
+	cfg  NodeConfig
 
 	state NodeState
 	mu    sync.RWMutex
@@ -92,16 +97,22 @@ type node struct {
 	// ctx can be cancelled to immediately cancel all in-flight requests on this node
 	ctx    context.Context
 	cancel context.CancelFunc
+	// wg waits for subsidiary goroutines
+	wg sync.WaitGroup
 
-	// specific to a particular state
-	brokenReason string
-	brokenAt     time.Time
+	// Specific to NodeStateOutOfSync
+	lastSeenBlock int64
+}
+
+type NodeConfig interface {
+	NodeDeadAfterNoNewHeadersThreshold() time.Duration
 }
 
 // NewNode returns a new *node as Node
-func NewNode(lggr logger.Logger, wsuri url.URL, httpuri *url.URL, name string) Node {
+func NewNode(nodeCfg NodeConfig, lggr logger.Logger, wsuri url.URL, httpuri *url.URL, name string) Node {
 	n := new(node)
 	n.name = name
+	n.cfg = nodeCfg
 	n.log = lggr.Named("Node").Named(name).With(
 		"nodeTier", "primary",
 	)
@@ -139,7 +150,7 @@ func (n *node) Dial(ctx context.Context) error {
 	uri := n.ws.uri.String()
 	wsrpc, err := rpc.DialWebsocket(ctx, uri, "")
 	if err != nil {
-		n.state = NodeStateBroken
+		n.state = NodeStateUnreachable
 		return errors.Wrapf(err, "error while dialing websocket: %v", uri)
 	}
 
@@ -148,7 +159,7 @@ func (n *node) Dial(ctx context.Context) error {
 		uri := n.http.uri.String()
 		httprpc, err = rpc.DialHTTP(uri)
 		if err != nil {
-			n.state = NodeStateBroken
+			n.state = NodeStateUnreachable
 			return errors.Wrapf(err, "error while dialing HTTP: %v", uri)
 		}
 	}
@@ -162,17 +173,26 @@ func (n *node) Dial(ctx context.Context) error {
 		n.http.geth = ethclient.NewClient(httprpc)
 	}
 
+	if deadAfter := n.cfg.NodeDeadAfterNoNewHeadersThreshold(); deadAfter > 0 {
+		n.log.Debug("Liveness checking enabled", "deadAfterThreshold", deadAfter)
+		n.wg.Add(1)
+		go n.livenessLoop()
+	} else {
+		n.log.Debug("Liveness checking disabled")
+	}
+
 	return nil
 }
 
 func (n *node) Close() {
+	n.cancel()
+	n.wg.Wait()
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.state = NodeStateClosed
 	if n.ws.rpc != nil {
 		n.ws.rpc.Close()
 	}
-	n.cancel()
 }
 
 // Verify checks that all connections to eth nodes match the given chain ID
@@ -182,11 +202,8 @@ func (n *node) Verify(ctx context.Context, expectedChainID *big.Int) (err error)
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.state == NodeStateUndialed {
-		return errors.New("cannot verify undialed node")
-	}
-	if n.state == NodeStateBroken {
-		return errors.New("cannot verify broken node")
+	if !(n.state == NodeStateDialed) {
+		return errors.Errorf("cannot verify node in state %v", n.state)
 	}
 
 	var chainID *big.Int
@@ -228,17 +245,17 @@ func (n *node) State() NodeState {
 	return n.state
 }
 
-func (n *node) DeclareBroken(reason string, brokenAt time.Time) {
+func (n *node) DeclareOutOfSync(lastSeenBlock int64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.state == NodeStateAlive {
+		// Need to disconnect all clients subscribed to this node
 		n.ws.rpc.Close()
-		n.cancel() // immediately cancel all pending calls that didn't get killed by closing RPC above
-		n.state = NodeStateBroken
-		n.brokenReason = reason
-		n.brokenAt = brokenAt
+		n.cancel() // cancel all pending calls that didn't get killed by closing RPC above
+		n.state = NodeStateOutOfSync
+		n.lastSeenBlock = lastSeenBlock
 	} else {
-		panic(fmt.Sprintf("cannot transition from %s to NodeStateBroken", n.state))
+		panic(fmt.Sprintf("cannot transition from %s to NodeStateOutOfSync", n.state))
 	}
 }
 

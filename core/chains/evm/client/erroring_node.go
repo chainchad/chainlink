@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"math/big"
+	"time"
 
 	ethereum "github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/common"
@@ -108,5 +109,7 @@ func (e *erroringNode) String() string {
 }
 
 func (e *erroringNode) State() NodeState {
-	return NodeStateDead
+	return NodeStateBroken
 }
+
+func (e *erroringNode) DeclareBroken(string, time.Time) {}
