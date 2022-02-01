@@ -7,12 +7,17 @@ import (
 	"time"
 
 	evmtypes "github.com/smartcontractkit/chainlink/core/chains/evm/types"
+	"github.com/smartcontractkit/chainlink/core/logger"
 	"github.com/smartcontractkit/chainlink/core/services"
 )
 
+// livenessChecker for now simply re-implements the exact same simple logic as
+// the Fiews failover proxy which has been battle-tested for a long time
 type livenessChecker struct {
-	pool *Pool
+	pool      *Pool
+	deadAfter time.Duration
 
+	logger logger.Logger
 	ctx    context.Context
 	cancel context.CancelFunc
 	chDone chan struct{}
@@ -20,9 +25,10 @@ type livenessChecker struct {
 
 var _ services.Service = &livenessChecker{}
 
-func newLivenessChecker(pool *Pool) *livenessChecker {
+func NewLivenessChecker(pool *Pool, lggr logger.Logger, deadAfter time.Duration) *livenessChecker {
+	lggr = lggr.Named("EVMLivenessChecker")
 	ctx, cancel := context.WithCancel(context.Background())
-	return &livenessChecker{pool, ctx, cancel, make(chan struct{})}
+	return &livenessChecker{pool, deadAfter, lggr, ctx, cancel, make(chan struct{})}
 }
 
 func (l *livenessChecker) Start() error {
@@ -39,140 +45,75 @@ func (l *livenessChecker) Close() error {
 func (l *livenessChecker) loop() {
 	defer close(l.chDone)
 
+	if l.deadAfter == 0 {
+		l.logger.Debug("Node dead after threshold set to 0; liveness checking is disabled")
+		return
+	}
+
 	var wg sync.WaitGroup
-	headCollection := &headsCollection{make(map[Node]int64), sync.RWMutex{}}
-	listeners := make(map[Node]*nodeMonitor)
+	// Head subscription for each node
+	// Mark broken if no heads for 3m
+	// TODO: Add logic to handle case if there are no live nodes left
 	wg.Add(len(l.pool.nodes))
 	for _, n := range l.pool.nodes {
-		ch := make(chan<- *evmtypes.Head)
-		m := &nodeMonitor{ch, -1}
-		listeners[n] = m
-		go n.loop(l.ctx, wg, headsCollection)
+		go l.loopNode(wg, n)
 	}
 
 	wg.Wait()
 }
 
-type headsCollection struct {
-	latestNums map[Node]int64
-	mu         sync.RWMutex
-}
-
-func (h *headsCollection) setLatest(n Node, latestNum int64) {
-	h.mu.Lock()
-	defer h.mu.RUnlock()
-	current := h.latestNums[n]
-	if latestNum > current {
-		h.latestNums[n] = latestNum
-	}
-}
-
-func (h *headsCollection) getLatest() (latest int64) {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	for _, n := range h.latestNums {
-		if n > latest {
-			latest = n
-		}
-	}
-	return
-}
-
-// const NoHeadsAlar
-type nodeMonitor struct {
-	node          Node
-	latestHeadNum int64
-}
-
-// From fiews failover proxy: https://github.com/Fiews/ChainlinkEthFailover/blob/master/index.js
-// const headersTimeout = process.env.HEADERS_TIMEOUT*1000 || 180000
-const headersTimeout = 3 * time.Minute // TODO: Needs to be configurable
-const headersCheckUpToDate = headersTimeout / 10
-
-// headNumLagThreshold is the maximum amount of heads the node is allowed to be
-// behind the latest head from all nodes before it is marked dead
-const headNumLagThreshold = 10
-
-func (nm *nodeMonitor) loop(ctx context.Context, wg sync.WaitGroup, h *headsCollection) {
+func (l *livenessChecker) loopNode(wg sync.WaitGroup, node Node) {
 	defer wg.Done()
+
+	lggr := l.logger.With("node", node.String())
+
 	ch := make(chan *evmtypes.Head)
-	sub, err := nm.node.EthSubscribe(ctx, ch, "newHeads")
+	sub, err := node.EthSubscribe(l.ctx, ch, "newHeads")
 	if err != nil {
-		panic("TODO", sub)
+		reason := fmt.Sprintf("initial subscription failed: %v", err)
+		lggr.Warn("Node detected broken, removed from live nodes pool", "err", reason)
+		node.DeclareBroken(reason, time.Now())
+		return
 	}
+	defer func() {
+		sub.Unsubscribe()
+	}()
+	lggr.Trace("successfully subscribed to heads feed")
 
-	t1 := time.NewTicker(headersTimeout)
-	t2 := time.NewTicker(headersCheckUpToDate)
-
-	var latest int64
+	deadT := time.NewTicker(l.deadAfter)
 
 	for {
 		select {
-		case <-ctx.Done():
+		case <-l.ctx.Done():
 			return
 
-		case blockHeader, open := <-ch:
+		case bh, open := <-ch:
+			lggr.Trace("got head, resetting timer", "head", bh)
 			if !open {
-				panic("TODO")
+				reason := "subscription channel unexpectedly closed"
+				lggr.Warn("Node detected broken, removed from live nodes pool", "err", reason)
+				node.DeclareBroken(reason, time.Now())
+				return
 			}
-			num := blockHeader.Number
-			if num > latest {
-				h.setLatest(nm.node, num)
-			}
-			t1.Reset(headersTimeout)
+			deadT.Reset(l.deadAfter)
 
-		case err, open := <-sub.Err():
-			if open && err != nil {
+		case err := <-sub.Err():
+			if err != nil {
 				// TODO: Put it into the revive loop
-				// TODO: DeclareDead(reason)
 				// TODO: What if all the nodes are dead?
-				nm.node.DeclareDead()
+				reason := fmt.Sprintf("subscription errored: %v", err)
+				lggr.Warn("Node detected broken, removed from live nodes pool", "err", reason)
+				node.DeclareBroken(reason, time.Now())
+				// exit loop
+				return
 			}
-		case <-t1.C:
-			// We haven't received a head on the channel for the threshold, mark it dead
-			panic("Node is dead, mark it")
-		case <-t2.C:
-			latestOfAll := h.getLatest()
-			if latest < latestOfAll-headNumLagThreshold {
-				nm.node.DeclareOutOfSync()
-			}
+		case <-deadT.C:
+			// We haven't received a head on the channel for at least the
+			// threshold amount of time, mark it broken
+			reason := fmt.Sprintf("no new heads received for %s", l.deadAfter)
+			lggr.Warn("Node detected broken, removed from live nodes pool", "err", reason)
+			node.DeclareBroken(reason, time.Now())
+			return
 		}
 	}
 }
-
-// func (l *livenessChecker) Listen
-//     defer done()
-//     defer hl.unsubscribe()
-
-//     ctx, cancel := utils.ContextFromChan(hl.chStop)
-//     defer cancel()
-
-// func (hl *headListener) subscribeToHead(ctx context.Context) error {
-//     hl.chHeaders = make(chan *evmtypes.Head)
-
-//     var err error
-//     hl.headSubscription, err = hl.ethClient.SubscribeNewHead(ctx, hl.chHeaders)
-//     if err != nil {
-//         close(hl.chHeaders)
-//         return errors.Wrap(err, "EthClient#SubscribeNewHead")
-//     }
-
-//     hl.connected.Store(true)
-
-//     return nil
-
-//     for {
-//         if !hl.subscribe(ctx) {
-//             break
-//         }
-//         err := hl.receiveHeaders(ctx, handleNewHead)
-//         if ctx.Err() != nil {
-//             break
-//         } else if err != nil {
-//             hl.logger.Errorw(fmt.Sprintf("Error in new head subscription, unsubscribed: %s", err.Error()), "err", err)
-//             continue
-//         } else {
-//             break
-//         }
-//     }
-// }
