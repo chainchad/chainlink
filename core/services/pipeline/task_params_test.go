@@ -44,6 +44,8 @@ func TestStringParam_UnmarshalPipelineParam(t *testing.T) {
 func TestBytesParam_UnmarshalPipelineParam(t *testing.T) {
 	t.Parallel()
 
+	hash := common.HexToHash("0x4f66347657ebfd02a1ec1c6d4038cb9f001606dea6af90e152577f897452fdef")
+
 	tests := []struct {
 		name     string
 		input    interface{}
@@ -52,6 +54,7 @@ func TestBytesParam_UnmarshalPipelineParam(t *testing.T) {
 	}{
 		{"string", "foo bar baz", pipeline.BytesParam("foo bar baz"), nil},
 		{"[]byte", []byte("foo bar baz"), pipeline.BytesParam("foo bar baz"), nil},
+		{"blockhash", hash[:], pipeline.BytesParam([]byte{0x4f, 0x66, 0x34, 0x76, 0x57, 0xeb, 0xfd, 0x02, 0xa1, 0xec, 0x1c, 0x6d, 0x40, 0x38, 0xcb, 0x9f, 0x00, 0x16, 0x06, 0xde, 0xa6, 0xaf, 0x90, 0xe1, 0x52, 0x57, 0x7f, 0x89, 0x74, 0x52, 0xfd, 0xef}), nil},
 		{"int", 12345, pipeline.BytesParam(nil), pipeline.ErrBadInput},
 	}
 
