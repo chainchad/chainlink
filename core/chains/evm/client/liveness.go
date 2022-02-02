@@ -73,6 +73,18 @@ func (n *node) livenessLoop() {
 }
 
 // reviveLoop takes an OutOfSync node and puts it back to live status if it
-// receives a head
+// receives a later head than one we have already seen
+// TODO: Can we safely use the block timestamp?
+// https://github.com/ethereum/wiki/blob/c02254611f218f43cbb07517ca8e5d00fd6d6d75/Block-Protocol-2.0.md
+// Is block.timestamp <= now + 900 and is block.timestamp >= parent.timestamp?
+// https://github.com/ethereum/go-ethereum/blob/afe344bcf31bfb477a6e1ad5b862a70fc5c1a22b/consensus/ethash/consensus.go#L46
+// Or 15s?
 func (n *node) reviveLoop() {
+	defer n.wg.Done()
+	// re-dial and subscribe until a later head is received
+	if err := n.dial(); err != nil {
+		panic("TODO")
+	}
+
+	// TODO: if state was previously OutOfSync, we need to check that it's synced now before proceeding
 }

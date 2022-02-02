@@ -104,7 +104,7 @@ func (p *Pool) runLoop() {
 
 func (p *Pool) redialDeadNodes(ctx context.Context) {
 	for _, n := range p.nodes {
-		if n.State() == NodeStateBroken {
+		if n.State() == NodeStateUnreachable {
 			if err := n.Dial(ctx); err != nil {
 				p.logger.Errorw(fmt.Sprintf("Failed to redial eth node: %v", err), "err", err, "node", n.String())
 			}

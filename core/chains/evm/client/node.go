@@ -29,6 +29,7 @@ type Node interface {
 
 	State() NodeState
 	DeclareOutOfSync(lastSeenBlock int64)
+	DeclareInSync()
 
 	CallContext(ctx context.Context, result interface{}, method string, args ...interface{}) error
 	BatchCallContext(ctx context.Context, b []rpc.BatchElem) error
@@ -124,27 +125,47 @@ func NewNode(nodeCfg NodeConfig, lggr logger.Logger, wsuri url.URL, httpuri *url
 	return n
 }
 
-// Dialling an Alive node is noop
-// Can dial Unreachable or Undialed nodes
-// Cannot dial a closed node
+// Dial opens a websocket connection to a remote eth node
 func (n *node) Dial(ctx context.Context) error {
 	ctx, cancel := n.wrapCtx(ctx)
 	defer cancel()
 
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if n.state == NodeStateAlive || n.state == NodeStateDialed {
+	switch n.state {
+	case NodeStateAlive, NodeStateDialed:
 		return nil
-	} else if n.state == NodeStateClosed {
+	case NodeStateClosed:
 		return errors.New("cannot dial closed node")
+	case NodeStateUndialed, NodeStateUnreachable:
+		// only these states can be dialed using the public method
+	default:
+		panic(fmt.Sprintf("cannot Dial node with state %v", n.state))
 	}
 
+	if err := n.dial(ctx); err != nil {
+		return err
+	}
+	n.state = NodeStateDialed
+
+	if deadAfter := n.cfg.NodeDeadAfterNoNewHeadersThreshold(); deadAfter > 0 {
+		n.log.Debug("Liveness checking enabled", "deadAfterThreshold", deadAfter)
+		n.wg.Add(1)
+		go n.livenessLoop()
+	} else {
+		n.log.Debug("Liveness checking disabled")
+	}
+
+	return nil
+}
+
+func (n *node) dial(ctx context.Context) error {
 	{
 		var httpuri string
 		if n.http != nil {
 			httpuri = n.http.uri.String()
 		}
-		n.log.Debugw("evmclient.Client#Dial(...)", "wsuri", n.ws.uri.String(), "httpuri", httpuri)
+		n.log.Debugw("evmclient.Client#dial(...)", "wsuri", n.ws.uri.String(), "httpuri", httpuri)
 	}
 
 	uri := n.ws.uri.String()
@@ -164,7 +185,6 @@ func (n *node) Dial(ctx context.Context) error {
 		}
 	}
 
-	n.state = NodeStateDialed
 	n.ws.rpc = wsrpc
 	n.ws.geth = ethclient.NewClient(wsrpc)
 
@@ -172,16 +192,6 @@ func (n *node) Dial(ctx context.Context) error {
 		n.http.rpc = httprpc
 		n.http.geth = ethclient.NewClient(httprpc)
 	}
-
-	if deadAfter := n.cfg.NodeDeadAfterNoNewHeadersThreshold(); deadAfter > 0 {
-		n.log.Debug("Liveness checking enabled", "deadAfterThreshold", deadAfter)
-		n.wg.Add(1)
-		go n.livenessLoop()
-	} else {
-		n.log.Debug("Liveness checking disabled")
-	}
-
-	return nil
 }
 
 func (n *node) Close() {
@@ -252,11 +262,18 @@ func (n *node) DeclareOutOfSync(lastSeenBlock int64) {
 		// Need to disconnect all clients subscribed to this node
 		n.ws.rpc.Close()
 		n.cancel() // cancel all pending calls that didn't get killed by closing RPC above
+		// Replace the context
+		// FIXME: Can this race?
+		n.ctx, n.cancel = context.WithCancel(context.Background())
 		n.state = NodeStateOutOfSync
 		n.lastSeenBlock = lastSeenBlock
 	} else {
 		panic(fmt.Sprintf("cannot transition from %s to NodeStateOutOfSync", n.state))
 	}
+}
+
+func (n *node) DeclareInSync() {
+	panic("TODO")
 }
 
 // RPC wrappers
