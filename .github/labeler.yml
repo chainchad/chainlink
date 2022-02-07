@@ -3,8 +3,9 @@
 
 "@domain/core":
 - any:
-  - '*'
+  - '*/*'
   - '!contracts/*'
+  - '!operator_ui/*'
 
 "@domain/core-ui":
 - any: ['operator_ui/*']
