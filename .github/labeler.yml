@@ -1,0 +1,10 @@
+"@domain/contracts":
+- any: ['contracts/*']
+
+"@domain/core":
+- any:
+  - '*'
+  - '!contracts/*'
+
+"@domain/core-ui":
+- any: ['operator_ui/*']
